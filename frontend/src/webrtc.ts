@@ -3,12 +3,21 @@ import { io, Socket } from "socket.io-client";
 export type ConnectionState = "disconnected" | "connecting" | "connected";
 
 export interface FileMetadata {
+  id: string;
   name: string;
   size: number;
   type: string;
 }
 
-const CHUNK_SIZE = 16384; // 16KB
+export interface FileTransfer {
+  id: string;
+  file: File;
+  metadata: FileMetadata;
+  progress: number;
+  status: "queued" | "transferring" | "completed" | "failed";
+}
+
+const CHUNK_SIZE = 16384;
 
 export class PeerManager {
   private socket: Socket;
@@ -17,21 +26,21 @@ export class PeerManager {
   private roomId: string = "";
   private onStateChange: (state: ConnectionState) => void;
   private onFileReceived: (file: Blob, metadata: FileMetadata) => void;
-  private onProgress: (progress: number) => void;
+  private onTransferUpdate: (transfer: FileTransfer) => void;
 
-  private receivedChunks: ArrayBuffer[] = [];
-  private currentFileMetadata: FileMetadata | null = null;
-  private bytesReceived = 0;
+  private pendingFiles: Map<string, { chunks: ArrayBuffer[]; metadata: FileMetadata; bytesReceived: number }> = new Map();
+  private fileQueue: FileTransfer[] = [];
+  private isProcessing = false;
 
   constructor(
     onStateChange: (state: ConnectionState) => void,
     onFileReceived: (file: Blob, metadata: FileMetadata) => void,
-    onProgress: (progress: number) => void
+    onTransferUpdate: (transfer: FileTransfer) => void
   ) {
-    this.socket = io("https://poems-complement-casey-mission.trycloudflare.com");
+    this.socket = io("http://localhost:3001");
     this.onStateChange = onStateChange;
     this.onFileReceived = onFileReceived;
-    this.onProgress = onProgress;
+    this.onTransferUpdate = onTransferUpdate;
 
     this.socket.on("user-joined", () => {
       console.log("Peer joined, initiating connection...");
@@ -98,43 +107,144 @@ export class PeerManager {
     this.dataChannel = channel;
     this.dataChannel.binaryType = "arraybuffer";
 
-    this.dataChannel.onopen = () => this.onStateChange("connected");
+    this.dataChannel.onopen = () => {
+      this.onStateChange("connected");
+      this.processQueue();
+    };
     this.dataChannel.onclose = () => this.onStateChange("disconnected");
 
     this.dataChannel.onmessage = (event) => {
       if (typeof event.data === "string") {
-        const metadata = JSON.parse(event.data) as FileMetadata;
-        this.currentFileMetadata = metadata;
-        this.receivedChunks = [];
-        this.bytesReceived = 0;
-      } else {
-        this.receivedChunks.push(event.data);
-        this.bytesReceived += event.data.byteLength;
-        if (this.currentFileMetadata) {
-          const progress = (this.bytesReceived / this.currentFileMetadata.size) * 100;
-          this.onProgress(progress);
-
-          if (this.bytesReceived >= this.currentFileMetadata.size) {
-            const blob = new Blob(this.receivedChunks, { type: this.currentFileMetadata.type });
-            this.onFileReceived(blob, this.currentFileMetadata);
-            this.currentFileMetadata = null;
-            this.onProgress(0);
+        try {
+          const data = JSON.parse(event.data);
+          if (data.fileId) {
+            const metadata: FileMetadata = {
+              id: data.fileId,
+              name: data.name,
+              size: data.size,
+              type: data.type
+            };
+            this.pendingFiles.set(data.fileId, {
+              chunks: [],
+              metadata,
+              bytesReceived: 0
+            });
+            
+            const transfer: FileTransfer = {
+              id: data.fileId,
+              file: new File([], data.name),
+              metadata,
+              progress: 0,
+              status: "transferring"
+            };
+            this.onTransferUpdate(transfer);
           }
+        } catch {
+          // Legacy format without fileId
+        }
+      } else {
+        const chunk = event.data as ArrayBuffer;
+        const view = new DataView(chunk);
+        const fileIdLength = view.getUint8(0);
+        const fileId = new TextDecoder().decode(chunk.slice(1, 1 + fileIdLength));
+        const actualChunk = chunk.slice(1 + fileIdLength);
+        
+        const fileData = this.pendingFiles.get(fileId);
+        if (!fileData) return;
+        
+        fileData.chunks.push(actualChunk);
+        fileData.bytesReceived += actualChunk.byteLength;
+        
+        const progress = (fileData.bytesReceived / fileData.metadata.size) * 100;
+        
+        const transfer: FileTransfer = {
+          id: fileId,
+          file: new File([], fileData.metadata.name),
+          metadata: fileData.metadata,
+          progress,
+          status: "transferring"
+        };
+        this.onTransferUpdate(transfer);
+
+        if (fileData.bytesReceived >= fileData.metadata.size) {
+          const blob = new Blob(fileData.chunks, { type: fileData.metadata.type });
+          this.onFileReceived(blob, fileData.metadata);
+          
+          const completedTransfer: FileTransfer = {
+            id: fileId,
+            file: new File([], fileData.metadata.name),
+            metadata: fileData.metadata,
+            progress: 100,
+            status: "completed"
+          };
+          this.onTransferUpdate(completedTransfer);
+          
+          this.pendingFiles.delete(fileId);
         }
       }
     };
   }
 
-  async sendFile(file: File) {
+  queueFiles(files: FileList | File[]) {
+    const fileArray = Array.from(files);
+    
+    for (const file of fileArray) {
+      const id = Math.random().toString(36).substring(2, 11);
+      const transfer: FileTransfer = {
+        id,
+        file,
+        metadata: {
+          id,
+          name: file.name,
+          size: file.size,
+          type: file.type
+        },
+        progress: 0,
+        status: "queued"
+      };
+      
+      this.fileQueue.push(transfer);
+      this.onTransferUpdate(transfer);
+    }
+
+    if (this.dataChannel?.readyState === "open" && !this.isProcessing) {
+      this.processQueue();
+    }
+  }
+
+  private async processQueue() {
+    if (this.isProcessing || this.fileQueue.length === 0) return;
+    
+    this.isProcessing = true;
+    
+    while (this.fileQueue.length > 0) {
+      const transfer = this.fileQueue.shift();
+      if (!transfer) continue;
+      
+      await this.sendFileInternal(transfer);
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    
+    this.isProcessing = false;
+  }
+
+  private async sendFileInternal(transfer: FileTransfer) {
     if (!this.dataChannel || this.dataChannel.readyState !== "open") return;
 
-    // Send metadata first
+    const updatingTransfer: FileTransfer = {
+      ...transfer,
+      status: "transferring"
+    };
+    this.onTransferUpdate(updatingTransfer);
+
     this.dataChannel.send(JSON.stringify({
-      name: file.name,
-      size: file.size,
-      type: file.type
+      fileId: transfer.metadata.id,
+      name: transfer.metadata.name,
+      size: transfer.metadata.size,
+      type: transfer.metadata.type
     }));
 
+    const file = transfer.file;
     const reader = new FileReader();
     let offset = 0;
 
@@ -145,24 +255,54 @@ export class PeerManager {
 
     reader.onload = (e) => {
       const chunk = e.target?.result as ArrayBuffer;
-      this.dataChannel!.send(chunk);
-      offset += chunk.byteLength;
+      if (chunk && chunk.byteLength > 0) {
+        const fileIdBytes = new TextEncoder().encode(transfer.metadata.id);
+        const combined = new Uint8Array(1 + fileIdBytes.length + chunk.byteLength);
+        combined[0] = fileIdBytes.length;
+        combined.set(fileIdBytes, 1);
+        combined.set(new Uint8Array(chunk), 1 + fileIdBytes.length);
+        
+        this.dataChannel!.send(combined);
+        offset += chunk.byteLength;
 
-      const progress = (offset / file.size) * 100;
-      this.onProgress(progress);
+        const progress = (offset / file.size) * 100;
+        
+        const updatingTransfer: FileTransfer = {
+          ...transfer,
+          progress,
+          status: "transferring"
+        };
+        this.onTransferUpdate(updatingTransfer);
 
-      if (offset < file.size) {
-        // Use a small delay or check bufferedAmount to avoid overwhelming the channel
-        if (this.dataChannel!.bufferedAmount > 16 * 1024 * 1024) { // 16MB buffer limit
-          setTimeout(readNextChunk, 100);
+        if (offset < file.size) {
+          if (this.dataChannel!.bufferedAmount > 16 * 1024 * 1024) {
+            setTimeout(readNextChunk, 100);
+          } else {
+            readNextChunk();
+          }
         } else {
-          readNextChunk();
+          const completedTransfer: FileTransfer = {
+            ...transfer,
+            progress: 100,
+            status: "completed"
+          };
+          this.onTransferUpdate(completedTransfer);
+          this.processQueue();
         }
-      } else {
-        this.onProgress(0);
       }
     };
 
     readNextChunk();
+  }
+
+  cancelTransfer(transferId: string) {
+    const index = this.fileQueue.findIndex(t => t.id === transferId);
+    if (index !== -1) {
+      this.fileQueue.splice(index, 1);
+    }
+  }
+
+  clearCompletedTransfers() {
+    this.fileQueue = this.fileQueue.filter(t => t.status !== "completed");
   }
 }
