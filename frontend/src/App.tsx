@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { PeerManager } from './webrtc';
-import type { ConnectionState, FileMetadata } from './webrtc';
+import type { ConnectionState, FileMetadata, FileTransfer } from './webrtc';
 import './index.css';
 
 interface ReceivedFile {
@@ -36,7 +36,7 @@ const App: React.FC = () => {
           { blob, metadata, id: Math.random().toString(36).slice(2, 11) }
         ]);
       },
-      (p) => setProgress(p)
+      (transfer: FileTransfer) => setProgress(transfer.progress)
     );
     
     pm.joinRoom(finalId);
